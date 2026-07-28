@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 #import psyplot.project as psy
 
 
-### FUNCTIONS (initially taken from Justine Charrel on SpiritX, 28/07/2026) ###
+### FUNCTIONS initially taken from Justine Charrel (on SpiritX, 28/07/2026) ###
 
 def load_dataset_by_prefix(path, prefix):
     pattern = os.path.join(path, f"{prefix}_*.nc")
@@ -115,7 +115,7 @@ def plot_outliers(ax, time_series, mask, marker='+', color='red', y_val=None):
         ax.legend(loc='upper right')
 
 
-## MY FUNCTIONS ##
+## DATASET MANAGEMENT ##
 
 def open_single_dataset(
     prefix: str,
@@ -124,6 +124,7 @@ def open_single_dataset(
     year: str,
     month: str,
     day: str,
+    drop_spc_bins=True,
     **xr_open_kwargs,
     ) -> Optional[xr.Dataset]:
     """
@@ -141,6 +142,11 @@ def open_single_dataset(
     path = Path(data_folder_path) / site / "L0" / year / month / day
 
     ds = load_dataset_by_prefix(path, prefix)
+    
+    if ds is not None:
+        if prefix == 'SPC' and drop_spc_bins:
+            ds = ds.drop('particle_count')
+            ds = ds.drop('bins')
 
     return ds
 
@@ -221,12 +227,13 @@ def open_and_concatenate_datasets(
             try:
                 concatenated_ds = xr.concat(site_datasets, dim="time")
                 # Reindex to regular time using the frequency from prefix_to_freq
-                datasets[site] = reindex_to_regular_time_auto(
-                    concatenated_ds,
-                    freq=freq,
-                    start=start_date,
-                    end=end_date
-                )
+                if freq is not None:
+                    datasets[site] = reindex_to_regular_time_auto(
+                        concatenated_ds,
+                        freq=freq,
+                        start=start_date,
+                        end=end_date
+                    )
                 print(f"Successfully concatenated {len(site_datasets)} files for site {site}.")
             except Exception as e:
                 print(f"Failed to concatenate datasets for {site}: {e}")
@@ -238,4 +245,103 @@ def open_and_concatenate_datasets(
     return datasets
 
 
+## STATS ##
+def compute_variable_stats(datasets: dict, variable: str) -> pd.DataFrame:
+    stats = []
+    for name, ds in datasets.items():
+        if variable in ds:
+            data = ds[variable].values
+            n_total = data.size
+            n_nan = np.isnan(data).sum()
+            stats.append({
+                "Dataset": name,
+                "Mean": np.nanmean(data),
+                "Min": np.nanmin(data),
+                "Max": np.nanmax(data),
+                "Std": np.nanstd(data),
+                "Data Points": n_total - n_nan,
+                "NaN Count": n_nan,
+                "NaN Fraction": n_nan / n_total if n_total > 0 else 0.0
+            })
+    return pd.DataFrame(stats)
 
+## PLOTTING ##
+def plot_multiple_datasets_separately(
+    datasets: Dict[str, xr.Dataset],
+    variables: List[str],
+    figsize: tuple = (15, 3),
+    ymin: Optional[float] = None,
+    ymax: Optional[float] = None,
+    **plot_kwargs
+) -> None:
+    """
+    Plot time series for each dataset in a single column, with all specified variables on each plot.
+    All plots share the same y-axis scale and the same time range.
+
+    Args:
+        datasets: Dictionary of xarray.Dataset objects (keys are dataset names).
+        variables: List of variable names to plot for each dataset.
+        figsize: Figure size for each subplot (width, height). Default: (15, 3).
+        ymin: Manually set the minimum y-axis limit. If None, it is computed from the data.
+        ymax: Manually set the maximum y-axis limit. If None, it is computed from the data.
+        **plot_kwargs: Additional keyword arguments for xarray's plot() method (e.g., color, linestyle).
+    """
+    if not datasets:
+        raise ValueError("No datasets provided.")
+
+    n_datasets = len(datasets)
+
+    # Create a figure with n_datasets subplots in a single column
+    fig, axes = plt.subplots(n_datasets, 1, figsize=(figsize[0], figsize[1] * n_datasets), sharey=True)
+
+    # Handle case where only one dataset is provided (axes is not a list)
+    if n_datasets == 1:
+        axes = [axes]
+
+    # Find global min/max for y-axis scaling
+    global_min, global_max = None, None
+    for ds in datasets.values():
+        for var in variables:
+            if var in ds:
+                var_min, var_max = ds[var].min().values, ds[var].max().values
+                if global_min is None or var_min < global_min:
+                    global_min = var_min
+                if global_max is None or var_max > global_max:
+                    global_max = var_max
+
+    # Override with user-provided ymin/ymax if specified
+    if ymin is not None:
+        global_min = ymin
+    if ymax is not None:
+        global_max = ymax
+
+    # Find global time range across all datasets
+    global_time_min = None
+    global_time_max = None
+    for ds in datasets.values():
+        if "time" in ds.coords:
+            time_min, time_max = ds.time.min().values, ds.time.max().values
+            if global_time_min is None or time_min < global_time_min:
+                global_time_min = time_min
+            if global_time_max is None or time_max > global_time_max:
+                global_time_max = time_max
+
+    # Plot each dataset
+    for ax, (name, ds) in zip(axes, datasets.items()):
+        for var in variables:
+            if var in ds:
+                ds[var].plot(ax=ax, label=var, **plot_kwargs)
+        ax.set_title(f"Dataset: {name}")
+        ax.set_ylabel("Value")
+        ax.legend()
+        ax.grid(True)
+
+        # Set consistent y-axis limits
+        if global_min is not None and global_max is not None:
+            ax.set_ylim(global_min, global_max)
+
+        # Set consistent x-axis limits (time range)
+        if global_time_min is not None and global_time_max is not None:
+            ax.set_xlim(global_time_min, global_time_max)
+
+    plt.tight_layout()
