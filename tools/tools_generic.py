@@ -28,7 +28,7 @@ import matplotlib.ticker as mticker
 import geopandas as gpd
 import glob
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timedelta
 #import psyplot.project as psy
 
@@ -234,7 +234,7 @@ def open_and_concatenate_datasets(
         if site_datasets:
             # Concatenate datasets for the site
             try:
-                concatenated_ds = xr.concat(site_datasets, dim="time")
+                concatenated_ds = xr.concat(site_datasets, dim="time")#, combine_attrs="drop_conflicts")
                 datasets[site] = concatenated_ds
                 print(f"Successfully concatenated {len(site_datasets)} files for site {site}.")
             except Exception as e:
@@ -264,6 +264,13 @@ def open_and_concatenate_datasets(
                 except Exception as e:
                     print(f"Failed reindexation for {site}: {e}")
                     # datasets[site] = None
+            
+            try:
+                for var in datasets[site].data_vars:
+                    if var in site_datasets[0].data_vars:
+                        datasets[site][var].attrs = site_datasets[0][var].attrs.copy()
+            except Exception as e:
+                    print(f"Lost attributes")
 
         else:
             print(f"No valid datasets found for site {site}.")
@@ -333,16 +340,82 @@ def clear_duplicates_reindex(
 
     return ds_reindexed
 
+def create_dict_data_datadaily(
+    sites: list,
+    sensors: list,
+    start_date: str,
+    end_date: str,
+ ) -> Dict[str, Dict[str, xr.Dataset]]:
+    """
+    Load and resample data for all sensors and sites.
+    Returns two dictionaries: `data` and `daily_data`.
+    """
+    data = {}
+    daily_data = {}
+
+    for sensor in sensors:
+        sensor_datasets = {}
+        for site in sites:
+            file_path = f'../../data/{sensor}_{site}_{start_date}_{end_date}.netcdf'
+
+            if not os.path.exists(file_path):
+                print(f"File not found: {file_path}")
+                continue
+
+            try:
+                ds = xr.open_dataset(file_path, engine='netcdf4')
+                sensor_datasets[site] = ds
+            except Exception as e:
+                print(f"Failed to open {file_path}: {e}")
+                continue
+
+        if sensor_datasets:
+            data[f"{sensor}"] = sensor_datasets
+            daily_datasets = {
+                name: ds.resample(time='1D').mean()
+                for name, ds in sensor_datasets.items()
+            }
+            daily_data[f"{sensor}"] = daily_datasets
+
+    return data, daily_data
+
 ## STATS ##
-def compute_variable_stats(datasets: dict, variable: str) -> pd.DataFrame:
+def compute_variable_stats(
+    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    variable: str,
+    sites: Optional[List[str]] = sites
+) -> pd.DataFrame:
+    """
+    Compute statistics for a specific variable across all sites and sensors.
+
+    Args:
+        sensor_datasets: Nested dictionary of datasets structured as {sensor: {site: dataset}}.
+        variable: Variable name to compute statistics for.
+        variable_to_sensor: Dictionary mapping variables to their respective sensors.
+        sites: Optional list of site names to include. If None, all sites are included.
+
+    Returns:
+        A pandas DataFrame with statistics for the variable across all specified sites.
+    """
     stats = []
-    for name, ds in datasets.items():
+
+    # Find the sensor for the variable
+    sensor = variable_to_sensor.get(variable)
+    if sensor is None:
+        raise ValueError(f"Variable '{variable}' not found in variable_to_sensor.")
+
+    # Iterate over all sites in the sensor's datasets
+    for site, ds in sensor_datasets.get(sensor, {}).items():
+        if sites is not None and site not in sites:
+            continue  # Skip if site is not in the provided list
+
         if variable in ds:
             data = ds[variable].values
             n_total = data.size
             n_nan = np.isnan(data).sum()
+
             stats.append({
-                "Dataset": name,
+                "Site": site,
                 "Mean": np.nanmean(data),
                 "Min": np.nanmin(data),
                 "Max": np.nanmax(data),
@@ -351,6 +424,7 @@ def compute_variable_stats(datasets: dict, variable: str) -> pd.DataFrame:
                 "NaN Count": n_nan,
                 "NaN Fraction": n_nan / n_total if n_total > 0 else 0.0
             })
+
     return pd.DataFrame(stats)
 
 ## PLOTTING ##
@@ -431,5 +505,105 @@ def plot_multiple_datasets_separately(
         # Set consistent x-axis limits (time range)
         if global_time_min is not None and global_time_max is not None:
             ax.set_xlim(global_time_min, global_time_max)
+
+    plt.tight_layout()
+
+def plot_variables_for_sites(
+    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    variables: List[str],
+    sites: List[str],
+    variable_to_sensor: Dict[str, str] = variable_to_sensor,
+    var_to_units: Optional[Dict[str, str]] = var_to_units,
+    var_to_longname: Optional[Dict[str, str]] = var_to_longname,
+    figsize: Tuple[int, int] = (15, 5),
+    ymin: Optional[List[float]] = None,
+    ymax: Optional[List[float]] = None,
+    colors: Optional[List[str]] = None,
+    **plot_kwargs
+) -> None:
+    """
+    Plot time series for each variable, with each site's data in a distinct color.
+    Each subplot corresponds to a variable, and the legend indicates the site.
+
+    Args:
+        sensor_datasets: Nested dictionary of datasets structured as {sensor: {site: dataset}}.
+        variables: List of variable names to plot.
+        sites: List of site names to include in the plot.
+        variable_to_sensor: Dictionary mapping variables to their respective sensors.
+        var_to_units: Dictionary mapping variables to their unit strings.
+        var_to_longname: Dictionary mapping variables to their descriptive long names.
+        figsize: Figure size for each subplot (width, height). Default: (15, 5).
+        ymin: List of minimum y-axis limits for each variable. If None, computed from the data.
+        ymax: List of maximum y-axis limits for each variable. If None, computed from the data.
+        colors: List of colors for each site. If None, uses default colors.
+        **plot_kwargs: Additional keyword arguments for xarray's plot() method (e.g., linestyle).
+    """
+    if not sensor_datasets or not variables or not sites:
+        raise ValueError("No datasets, variables, or sites provided.")
+
+    if variable_to_sensor is None:
+        raise ValueError("variable_to_sensor dictionary is required.")
+
+    if ymin is not None and len(ymin) != len(variables):
+        raise ValueError("Length of ymin must match the number of variables.")
+    if ymax is not None and len(ymax) != len(variables):
+        raise ValueError("Length of ymax must match the number of variables.")
+
+    if colors is not None and len(colors) != len(sites):
+        raise ValueError("Length of colors must match the number of sites.")
+
+    n_variables = len(variables)
+    fig, axes = plt.subplots(n_variables, 1, figsize=(figsize[0], figsize[1] * n_variables), sharex=True)
+
+    if n_variables == 1:
+        axes = [axes]
+
+    # Plot each variable
+    for ax, var, var_ymin, var_ymax in zip(axes, variables, (ymin or [None] * n_variables), (ymax or [None] * n_variables)):
+        # Find the sensor for the current variable
+        sensor = variable_to_sensor.get(var)
+        if sensor is None:
+            print(f"Warning: Variable '{var}' not found in variable_to_sensor. Skipping.")
+            continue
+
+        # Find the min/max for this variable across all sites
+        var_min, var_max = None, None
+        for site in sites:
+            if site in sensor_datasets.get(sensor, {}):
+                ds = sensor_datasets[sensor][site]
+                if var in ds:
+                    site_min, site_max = ds[var].min().values, ds[var].max().values
+                    if var_min is None or site_min < var_min:
+                        var_min = site_min
+                    if var_max is None or site_max > var_max:
+                        var_max = site_max
+
+        # Override with user-provided ymin/ymax if specified
+        if var_ymin is not None:
+            var_min = var_ymin
+        if var_ymax is not None:
+            var_max = var_ymax
+
+        # Plot the variable for each site
+        for i, site in enumerate(sites):
+            if site in sensor_datasets.get(sensor, {}):
+                ds = sensor_datasets[sensor][site]
+                if var in ds:
+                    # Set color for this site
+                    site_color = colors[i] if colors else None
+                    ds[var].plot(ax=ax, label=f"{site}", color=site_color, **plot_kwargs)
+
+        # Retrieve metadata for titles and labels (with safe fallbacks)
+        long_name = (var_to_longname or {}).get(var, var)
+        unit = (var_to_units or {}).get(var, "")
+
+        ax.set_title(f"{long_name} ({var})", fontsize=12, fontweight="bold")
+        ax.set_ylabel(f"[{unit}]" if unit else "Value")
+        ax.legend()
+        ax.grid(True)
+
+        # Set y-axis limits for this variable
+        if var_min is not None and var_max is not None:
+            ax.set_ylim(var_min, var_max)
 
     plt.tight_layout()
