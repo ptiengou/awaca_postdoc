@@ -1,3 +1,4 @@
+from info import *
 import numpy as np
 import netCDF4 as nc
 import xarray as xr
@@ -33,8 +34,67 @@ from datetime import datetime, timedelta
 
 
 ### FUNCTIONS initially taken from Justine Charrel (on SpiritX, 28/07/2026) ###
+    
 
-def load_dataset_by_prefix(path, prefix):
+def reindex_to_regular_time_auto(obj, freq, start, end):
+    print(f'Reindexing start : {start}')
+    print(f'Reindexing end : {end}')
+    if 'time' not in obj.dims:
+        raise ValueError("L'objet n'a pas de dimension 'time'.")
+    times = pd.to_datetime(obj.time.values)
+    offset_seconds = pd.Series(times.second).mode().iloc[0]
+    offset = pd.Timedelta(seconds=offset_seconds)
+    full_time = pd.date_range(start + offset, end, freq=freq)
+    print('REINDEXED TIME')
+    return obj.reindex(time=full_time)
+    
+def resolve_column(dataset, candidates):
+    """Return first corresponding variable present in xarray.Dataset"""
+    for name in candidates:
+        if name in dataset.data_vars:
+            return dataset[name]
+    return None
+
+def plot_outliers(ax, time_series, mask, marker='+', color='red', y_val=None):
+    if mask.any():
+        masked_times = time_series[mask]
+
+        if y_val is None:
+            y_min, y_max = ax.get_ylim()
+            y_val = y_min
+
+        ax.scatter(masked_times, np.full(len(masked_times), y_val),
+                   color=color, s=20, marker=marker, label="Outliers")
+        ax.legend(loc='upper right')
+
+
+## DATASET MANAGEMENT ##
+
+def open_single_dataset(
+    prefix: str,
+    data_folder_path: str,
+    site: str,
+    year: str,
+    month: str,
+    day: str,
+    drop_spc_bins=True,
+    resample_mean=False,
+    **xr_open_kwargs,
+    ) -> Optional[xr.Dataset]:
+    """
+    Open a single NetCDF file for a specific site and day, with optional checks.
+
+    Args:
+        data_folder_path: Base path to the data folder (e.g., "/path/to/data").
+        site: Site name (e.g., "d17").
+        year: Year as a string (e.g., "2025").
+        month: Month as a string (e.g., "01").
+        day: Day as a string (e.g., "01").
+        **xr_open_kwargs: Additional keyword arguments to pass to `xr.open_dataset`.
+    """
+    # Construct the filename
+    path = Path(data_folder_path) / site / "L0" / year / month / day
+
     pattern = os.path.join(path, f"{prefix}_*.nc")
     files = sorted(glob.glob(pattern))
     print(f"[INFO] {len(files)} {prefix} files found in {path}.")
@@ -84,69 +144,19 @@ def load_dataset_by_prefix(path, prefix):
         if n_dup > 0:
             print(f"[INFO] Removed {n_dup} duplicated timestamps from {prefix} dataset.")
 
-    return ds
-
-def reindex_to_regular_time_auto(obj, freq, start, end):
-    if 'time' not in obj.dims:
-        raise ValueError("L'objet n'a pas de dimension 'time'.")
-    times = pd.to_datetime(obj.time.values)
-    offset_seconds = pd.Series(times.second).mode().iloc[0]
-    offset = pd.Timedelta(seconds=offset_seconds)
-    full_time = pd.date_range(start + offset, end, freq=freq)
-    return obj.reindex(time=full_time)
-    
-def resolve_column(dataset, candidates):
-    """Return first corresponding variable present in xarray.Dataset"""
-    for name in candidates:
-        if name in dataset.data_vars:
-            return dataset[name]
-    return None
-
-def plot_outliers(ax, time_series, mask, marker='+', color='red', y_val=None):
-    if mask.any():
-        masked_times = time_series[mask]
-
-        if y_val is None:
-            y_min, y_max = ax.get_ylim()
-            y_val = y_min
-
-        ax.scatter(masked_times, np.full(len(masked_times), y_val),
-                   color=color, s=20, marker=marker, label="Outliers")
-        ax.legend(loc='upper right')
-
-
-## DATASET MANAGEMENT ##
-
-def open_single_dataset(
-    prefix: str,
-    data_folder_path: str,
-    site: str,
-    year: str,
-    month: str,
-    day: str,
-    drop_spc_bins=True,
-    **xr_open_kwargs,
-    ) -> Optional[xr.Dataset]:
-    """
-    Open a single NetCDF file for a specific site and day, with optional checks.
-
-    Args:
-        data_folder_path: Base path to the data folder (e.g., "/path/to/data").
-        site: Site name (e.g., "d17").
-        year: Year as a string (e.g., "2025").
-        month: Month as a string (e.g., "01").
-        day: Day as a string (e.g., "01").
-        **xr_open_kwargs: Additional keyword arguments to pass to `xr.open_dataset`.
-    """
-    # Construct the filename
-    path = Path(data_folder_path) / site / "L0" / year / month / day
-
-    ds = load_dataset_by_prefix(path, prefix)
     
     if ds is not None:
+        # remove bins for SPC
         if prefix == 'SPC' and drop_spc_bins:
             ds = ds.drop('particle_count')
             ds = ds.drop('bins')
+
+        # resample
+        resample_freq = prefix_to_resample_freq.get(prefix, None)
+        if resample_mean :
+            ds = ds.resample(time=resample_freq).mean()
+        
+
 
     return ds
 
@@ -160,7 +170,8 @@ def open_and_concatenate_datasets(
     end_month: str,
     begin_day: str,
     end_day: str,
-    prefix_to_freq: Dict[str, str],
+    resample_mean=False,
+    reindex=False,
     **xr_open_kwargs,
     ) -> Dict[str, Optional[xr.Dataset]]:
     """
@@ -186,15 +197,12 @@ def open_and_concatenate_datasets(
     """
     datasets = {}
 
-    # Get the frequency for the current prefix
-    freq = prefix_to_freq.get(prefix, '10min')  # Default to '10min' if prefix not found
-
     for site in site_list:
         site_datasets = []
 
         # Generate all dates in the range
         start_date = datetime(int(begin_year), int(begin_month), int(begin_day))
-        end_date = datetime(int(end_year), int(end_month), int(end_day))
+        end_date = datetime(int(end_year), int(end_month), int(end_day)) + timedelta(days=1)
 
         current_date = start_date
         while current_date <= end_date:
@@ -210,6 +218,7 @@ def open_and_concatenate_datasets(
                     year=year,
                     month=month,
                     day=day,
+                    resample_mean =resample_mean,
                     **xr_open_kwargs,
                 )
                 if ds is not None:
@@ -221,29 +230,108 @@ def open_and_concatenate_datasets(
 
             # Move to the next day
             current_date += timedelta(days=1)
-
-        # Concatenate datasets for the site
+        
         if site_datasets:
+            # Concatenate datasets for the site
             try:
                 concatenated_ds = xr.concat(site_datasets, dim="time")
-                # Reindex to regular time using the frequency from prefix_to_freq
-                if freq is not None:
-                    datasets[site] = reindex_to_regular_time_auto(
-                        concatenated_ds,
-                        freq=freq,
-                        start=start_date,
-                        end=end_date
-                    )
+                datasets[site] = concatenated_ds
                 print(f"Successfully concatenated {len(site_datasets)} files for site {site}.")
             except Exception as e:
                 print(f"Failed to concatenate datasets for {site}: {e}")
                 datasets[site] = None
+
+            # Reindex datasets for the site
+            if reindex:
+                try:
+                    resample_freq = prefix_to_resample_freq.get(prefix, None)
+                    acq_freq = prefix_to_acquisition_freq.get(prefix, None)
+                    if resample_mean : 
+                        index_freq = resample_freq
+                    else:
+                        index_freq = acq_freq
+                    if index_freq is not None:
+                        datasets[site] = clear_duplicates_reindex(
+                            datasets[site],
+                            prefix=prefix,
+                            begin_year=begin_year,
+                            begin_month=begin_month,
+                            begin_day=begin_day,
+                            end_year=end_year,
+                            end_month=end_month,
+                            end_day=end_day
+                        )
+                except Exception as e:
+                    print(f"Failed reindexation for {site}: {e}")
+                    # datasets[site] = None
+
         else:
             print(f"No valid datasets found for site {site}.")
             datasets[site] = None
 
     return datasets
 
+def clear_duplicates_reindex( 
+    ds: xr.Dataset,
+    prefix: str,
+    begin_year: str,
+    begin_month: str,
+    begin_day: str,
+    end_year: str,
+    end_month: str,
+    end_day: str,
+    keep_first: bool = True,
+ ) -> xr.Dataset:
+    """
+    Remove duplicate timestamps, reindex to a regular time grid, and return the cleaned dataset.
+    The frequency for reindexing is retrieved from the `prefix_to_resample_freq` dictionary.
+
+    Args:
+        ds: Input xarray Dataset with a 'time' dimension.
+        prefix: Prefix to look up the resampling frequency in `prefix_to_resample_freq`.
+        begin_year: Start year (e.g., "2023").
+        begin_month: Start month (e.g., "01").
+        begin_day: Start day (e.g., "01").
+        end_year: End year (e.g., "2023").
+        end_month: End month (e.g., "12").
+        end_day: End day (e.g., "31").
+        keep_first: If True, keep the first occurrence of duplicates. Defaults to True.
+
+    Returns:
+        xarray Dataset with duplicates removed and reindexed to the specified time range.
+
+    Raises:
+        ValueError: If the `prefix` is not found in `prefix_to_resample_freq`.
+    """
+    # Retrieve the frequency from the dictionary
+    freq = prefix_to_resample_freq.get(prefix)
+    if freq is None:
+        raise ValueError(f"No frequency found for prefix '{prefix}' in prefix_to_resample_freq.")
+
+    # Step 1: Check for duplicates and print their count and dates
+    time_series = ds.time.to_series()
+    has_duplicates = time_series.duplicated().any()
+    if has_duplicates:
+        duplicate_counts = time_series.value_counts()
+        duplicates = duplicate_counts[duplicate_counts > 1]
+        print(f"Number of duplicate timestamps: {len(duplicates)}")
+        print(f"Duplicate dates: {list(duplicates.index.strftime('%Y-%m-%d %H:%M:%S'))}")
+
+    # Step 2: Remove duplicates
+    if keep_first:
+        df = ds.to_dataframe().reset_index()
+        df_unique = df.drop_duplicates(subset=["time"], keep='first')
+        ds_unique = df_unique.set_index("time").to_xarray()
+
+    # Step 3: Reindex to the full time range
+    start_date = datetime(int(begin_year), int(begin_month), int(begin_day))
+    end_date = datetime(int(end_year), int(end_month), int(end_day)) + timedelta(days=1)
+    full_time = pd.date_range(start=start_date, end=end_date, freq=freq)
+
+    # Reindex the dataset
+    ds_reindexed = ds_unique.reindex(time=full_time)
+
+    return ds_reindexed
 
 ## STATS ##
 def compute_variable_stats(datasets: dict, variable: str) -> pd.DataFrame:
@@ -273,7 +361,7 @@ def plot_multiple_datasets_separately(
     ymin: Optional[float] = None,
     ymax: Optional[float] = None,
     **plot_kwargs
-) -> None:
+ ) -> None:
     """
     Plot time series for each dataset in a single column, with all specified variables on each plot.
     All plots share the same y-axis scale and the same time range.
