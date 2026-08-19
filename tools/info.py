@@ -6,7 +6,8 @@ prefix_to_resample_freq = {
     'SPC':'10min',
     'SURF':'10min',
     'WIND':'10min',
-    'METEK':'100ms'
+    'METEK':'100ms',
+    'SURF_TABLE':'10min'
 }
 
 prefix_to_acquisition_freq = {
@@ -14,7 +15,8 @@ prefix_to_acquisition_freq = {
     'SPC':'1s',
     'SURF':'1min',
     'WIND':'1s',
-    'METEK':'100ms'
+    'METEK':'100ms',
+    'SURF_WIND':'100ms'
 }
 
 
@@ -69,6 +71,9 @@ variable_to_sensor = {
     "wind_v_3_Max": "SURF",
     "wind_v_2_Max": "SURF",
     "wdir2": "SURF",
+    "RH1":"SURF",
+    "RH2":"SURF",
+    "RH3":"SURF",
 
     # WIND variables
     "wdir": "WIND",
@@ -132,6 +137,9 @@ var_to_longname = {
     "wind_v_3_Max": "Maximum V-Component Wind Speed Level 3",
     "wind_v_2_Max": "Maximum V-Component Wind Speed Level 2",
     "wdir2": "Wind Direction Level 2",
+    "RH1":"Relative humidity Level 1",
+    "RH2":"Relative humidity Level 2",
+    "RH3":"Relative humidity Level 3",
 
     # WIND variables
     "wdir": "Wind Direction",
@@ -198,3 +206,10 @@ var_to_units = {
     "wspd1_Avg": "m s⁻¹",
     "wspd2_Avg": "m s⁻¹",
 }
+
+var_to_maxval = {
+    'snowflux'  : 300,
+    'FluxMean1' : 300
+}
+
+
