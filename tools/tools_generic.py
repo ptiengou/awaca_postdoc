@@ -361,6 +361,25 @@ def create_daily_data(
 
     return daily_data
 
+def create_resampled_data(
+    data: Dict[str, Dict[str, xr.Dataset]],
+    sampling: str,
+) -> Dict[str, Dict[str, xr.Dataset]]:
+    """
+    Resample raw data into averages.
+    Returns a nested dictionary: {sensor: {site: xr.Dataset}}.
+    """
+    sampled_data = {}
+
+    for sensor, sensor_datasets in data.items():
+        sampled_datasets = {
+            site: ds.resample(time=sampling).mean()
+            for site, ds in sensor_datasets.items()
+        }
+        sampled_data[sensor] = sampled_datasets
+
+    return sampled_data
+
 def filter_data_by_max_values(data: dict, variables: list):
     """
     Filter datasets in the data dictionary by replacing values above the max value

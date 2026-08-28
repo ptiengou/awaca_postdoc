@@ -17,6 +17,7 @@ from scipy.stats import ttest_ind
 import scipy.stats as stats
 from scipy.stats import linregress
 from scipy.interpolate import griddata
+from scipy.integrate import trapezoid
 from matplotlib.markers import MarkerStyle
 import json
 from pprint import pprint
