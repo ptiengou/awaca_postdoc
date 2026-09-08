@@ -517,6 +517,143 @@ def _format_var_label(var: str, site: str, var_to_units: Optional[Dict[str, str]
     unit = (var_to_units or {}).get(var, "")
     return f"{long_name} ({site})" + (f" [{unit}]" if unit else "")
 
+def resample_dbz(
+    obj: xr.Dataset | xr.DataArray,
+    var_name: str = "Zea",
+    freq: str = "10min",
+    min_count: int = 1,
+) -> xr.DataArray | xr.Dataset:
+    """Resamples a radar reflectivity field in dBZ to a specified time frequency
+
+    using linear reflectivity averaging.
+
+    Parameters
+    ----------
+    obj : xr.Dataset or xr.DataArray
+        The input MRR xarray object.
+    var_name : str, default 'Zea'
+        The target dBZ variable name if `obj` is a Dataset.
+    freq : str, default '10min'
+        Pandas/xarray time frequency string (e.g., '10min', '15min', '1H').
+    min_count : int, default 1
+        Minimum number of valid time steps required per bin; returns NaN if
+        fewer.
+
+    Returns
+    -------
+    xr.DataArray or xr.Dataset
+        The time-resampled object in dBZ.
+    """
+    # 1. Extract target DataArray
+    if isinstance(obj, xr.Dataset):
+        da = obj[var_name]
+    elif isinstance(obj, xr.DataArray):
+        da = obj
+        var_name = da.name or "Zea"
+    else:
+        raise TypeError("Input must be an xarray DataArray or Dataset.")
+
+    # 2. Linearize reflectivity (dBZ -> mm^6 m^-3)
+    da_linear = 10.0 ** (da / 10.0)
+
+    # 3. Resample & average in linear space
+    da_lin_resampled = da_linear.resample(time=freq).mean(
+        dim="time"#, min_count=min_count
+    )
+
+    # 4. Convert back to dBZ safely (ignoring warnings for zeros/NaNs)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        da_dbz = 10.0 * np.log10(da_lin_resampled.where(da_lin_resampled > 0))
+
+    # Preserve metadata
+    da_dbz.name = var_name
+    da_dbz.attrs = da.attrs
+    da_dbz.attrs["units"] = "dBZ"
+
+    # Return same data structure as input
+    if isinstance(obj, xr.Dataset):
+        resample_ds = obj.resample(time=freq).first()
+        resample_ds[var_name] = da_dbz
+        return resample_ds
+
+    return da_dbz
+
+def compute_vertical_over_threshold_fraction(
+    ds_or_da: xr.Dataset | xr.DataArray,
+    var_name: str = "Zea",
+    vertical_dim: str = "range",
+    threshold: float = -5.0,
+    height_slice: tuple[float, float] | None = None,
+) -> xr.DataArray:
+    """Calculates the fraction of vertical levels exceeding a given threshold
+
+    for each time step, with an optional vertical height slice.
+
+    Parameters
+    ----------
+    ds_or_da : xr.Dataset or xr.DataArray
+        The input xarray Dataset or DataArray.
+    var_name : str, default 'Zea'
+        The target variable name if `ds_or_da` is a Dataset.
+    vertical_dim : str, default 'range'
+        The name of the vertical dimension over which to compute the fraction.
+    threshold : float, default -5.0
+        The minimum threshold value (e.g. -5 dBZ).
+    height_slice : tuple of (float, float), optional
+        Optional vertical height bounds as (min_height, max_height), e.g., (300, 1200).
+        If provided, the dataset will be sliced along `vertical_dim` before computing.
+
+    Returns
+    -------
+    xr.DataArray
+        A 1D DataArray indexed by time containing the vertical fraction (0.0 to 1.0)
+        exceeding the threshold for each profile.
+    """
+    # 1. Extract DataArray
+    if isinstance(ds_or_da, xr.Dataset):
+        if var_name not in ds_or_da:
+            raise KeyError(
+                f"Variable '{var_name}' not found in the provided Dataset."
+            )
+        da = ds_or_da[var_name]
+    elif isinstance(da_or_ds, xr.DataArray):
+        da = ds_or_da
+        var_name = da.name or var_name
+    else:
+        raise TypeError("Input must be an xarray Dataset or DataArray.")
+
+    if vertical_dim not in da.dims:
+        raise KeyError(
+            f"Vertical dimension '{vertical_dim}' not found in DataArray dimensions {da.dims}."
+        )
+
+    # 2. Apply optional vertical slicing
+    if height_slice is not None:
+        if len(height_slice) != 2:
+            raise ValueError(
+                "`height_slice` must be a tuple of length 2: (min_height, max_height)."
+            )
+        da = da.sel({vertical_dim: slice(height_slice[0], height_slice[1])})
+
+    # 3. Boolean mask of values exceeding threshold
+    over_thresh = da > threshold
+
+    # 4. Calculate fraction of vertical levels exceeding threshold
+    fraction = over_thresh.mean(dim=vertical_dim, skipna=True)
+
+    # 5. Set metadata attributes
+    slice_str = (
+        f" between {height_slice[0]} and {height_slice[1]}"
+        if height_slice
+        else ""
+    )
+    fraction.name = f"{var_name}_fraction_above_{threshold}dBZ"
+    fraction.attrs["units"] = "1"
+    fraction.attrs[
+        "description"
+    ] = f"Fraction of vertical levels along {vertical_dim}{slice_str} where {var_name} > {threshold}"
+
+    return fraction
 
 ## STATS ##
 def compute_variable_stats(

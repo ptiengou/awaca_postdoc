@@ -33,6 +33,8 @@ from datetime import datetime, timedelta
 import seaborn as sns
 import scipy.ndimage
 from collections import defaultdict
+from functools import partial
+from sklearn.cluster import KMeans
 
 
 #import psyplot.project as psy

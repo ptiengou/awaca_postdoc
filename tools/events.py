@@ -162,6 +162,110 @@ class Event:
 
         return integrated_val       
 
+    def add_external_variable(
+        self,
+        ext_ds: Union[xr.Dataset, xr.DataArray],
+        var_name: str,
+        ext_var_name: Optional[str] = None,
+        tolerance: Optional[pd.Timedelta] = pd.Timedelta("1s"),
+    ) -> bool:
+        """Adds a variable from an external dataset to the Event's internal dataset.
+
+        Checks time overlap, extracts the event window, verifies time step consistency,
+        and assigns the variable to self.ds.
+
+        Parameters
+        ----------
+        ext_ds : xr.Dataset or xr.DataArray
+            External xarray object containing the variable.
+        var_name : str
+            Name to give the variable when stored in self.ds.
+        ext_var_name : str, optional
+            Name of the variable in ext_ds if it differs from var_name, or if ext_ds
+            is a Dataset. If ext_ds is a DataArray, this can be None.
+        tolerance : pd.Timedelta, optional
+            Maximum allowed difference when matching time coordinates, by default 1s.
+            Set to None to require exact time coordinate equality.
+
+        Returns
+        -------
+        bool
+            True if the variable was successfully added, False otherwise.
+        """
+        # 1. Extract the target DataArray
+        if isinstance(ext_ds, xr.DataArray):
+            da_ext = ext_ds
+        elif isinstance(ext_ds, xr.Dataset):
+            target_key = ext_var_name if ext_var_name is not None else var_name
+            if target_key not in ext_ds:
+                print(
+                    f"[Event {self.event_id}] Variable '{target_key}' not found in external Dataset."
+                )
+                return False
+            da_ext = ext_ds[target_key]
+        else:
+            raise TypeError("ext_ds must be an xarray Dataset or DataArray.")
+
+        # 2. Verify external time dimension existence
+        if self.time_dim not in da_ext.dims:
+            print(
+                f"[Event {self.event_id}] Time dimension '{self.time_dim}' not found in external data."
+            )
+            return False
+
+        # 3. Slice external data over the event window
+        da_sliced = da_ext.sel(
+            {self.time_dim: slice(self.start_time, self.end_time)}
+        )
+
+        # 4. Check if any data exists within the time window
+        if da_sliced.sizes[self.time_dim] == 0:
+            print(
+                f"[Event {self.event_id}] No data available for variable '{var_name}' "
+                f"between {self.start_time} and {self.end_time}."
+            )
+            return False
+
+        # 5. Check time coordinate consistency against Event time grid
+        event_times = pd.to_datetime(self.ds[self.time_dim].values)
+        ext_times = pd.to_datetime(da_sliced[self.time_dim].values)
+
+        if len(event_times) != len(ext_times):
+            print(
+                f"[Event {self.event_id}] Time sampling mismatch for '{var_name}': "
+                f"Event has {len(event_times)} steps, but external data has {len(ext_times)} steps."
+            )
+            return False
+
+        # Check alignment of timestamps (exact or within tolerance)
+        time_diffs = np.abs(event_times - ext_times)
+        if tolerance is not None:
+            max_diff = time_diffs.max()
+            if max_diff > tolerance:
+                print(
+                    f"[Event {self.event_id}] Time alignment failed for '{var_name}': "
+                    f"Max timestamp difference ({max_diff}) exceeds tolerance ({tolerance})."
+                )
+                return False
+        else:
+            if not np.array_equal(event_times, ext_times):
+                print(
+                    f"[Event {self.event_id}] Timestamps for '{var_name}' do not match Event time axis exactly."
+                )
+                return False
+
+        # 6. Reassign external coordinate values to match event time axis to prevent coordinate duplicate errors
+        da_aligned = da_sliced.assign_coords(
+            {self.time_dim: self.ds[self.time_dim]}
+        )
+
+        # 7. Add to internal dataset
+        self.ds = self.ds.assign({var_name: da_aligned})
+        print(
+            f"[Event {self.event_id}] Successfully added '{var_name}' to event dataset."
+        )
+        return True
+
 class EventCollection:
     """
     Container class for managing, filtering, and analysing a list of Event objects.
@@ -375,6 +479,111 @@ class EventCollection:
         counts.index.name = "month"
         
         return counts
+
+    def add_external_variable(
+        self,
+        ext_ds: Union[xr.Dataset, xr.DataArray],
+        var_name: str,
+        ext_var_name: Optional[str] = None,
+        tolerance: Optional[pd.Timedelta] = pd.Timedelta("1s"),
+        verbose: bool = True,
+    ) -> Dict[str, int]:
+        """Adds an external variable to all events in the collection.
+
+        Iterates through each Event and calls its internal `add_external_variable`
+        method.
+
+        Parameters
+        ----------
+        ext_ds : xr.Dataset or xr.DataArray
+            External dataset containing the target variable across time.
+        var_name : str
+            Name to give the variable when assigned inside each Event's dataset.
+        ext_var_name : str, optional
+            Name of the variable in `ext_ds` if it differs from `var_name`.
+        tolerance : pd.Timedelta, optional
+            Maximum allowed timestamp misalignment tolerance, by default 1s.
+        verbose : bool, default True
+            If True, prints progress and summary status for the collection.
+
+        Returns
+        -------
+        Dict[str, int]
+            Summary dictionary containing counts of 'success' and 'failed' updates.
+        """
+        if not self.events:
+            if verbose:
+                print("EventCollection is empty. No variables added.")
+            return {"success": 0, "failed": 0}
+
+        success_count = 0
+        failed_count = 0
+
+        if verbose:
+            print(
+                f"Adding variable '{var_name}' across {len(self.events)} events..."
+            )
+
+        for event in self.events:
+            # Call the Event-level method
+            added = event.add_external_variable(
+                ext_ds=ext_ds,
+                var_name=var_name,
+                ext_var_name=ext_var_name,
+                tolerance=tolerance,
+            )
+
+            if added:
+                success_count += 1
+            else:
+                failed_count += 1
+
+        if verbose:
+            print(
+                f"Finished: Successfully added '{var_name}' to {success_count}/{len(self.events)} events "
+                f"({failed_count} skipped/failed)."
+            )
+
+        return {"success": success_count, "failed": failed_count}
+
+    def classify(
+        self, 
+        classifier_func: Callable[["EventCollection"], List[Union[str, int]]]
+    ) -> Dict[Union[str, int], "EventCollection"]:
+        """
+        Categorises events using an external classification function.
+
+        Parameters
+        ----------
+        classifier_func : Callable
+            A function that takes the EventCollection as input and returns 
+            a list of labels (strings or integers) of the same length as self.events.
+
+        Returns
+        -------
+        Dict[Union[str, int], EventCollection]
+            A dictionary mapping each unique label to a new EventCollection 
+            containing the respective subset of events.
+        """
+        if not self.events:
+            return {}
+
+        # 1. Generate labels using the provided strategy
+        labels = classifier_func(self)
+
+        if len(labels) != len(self.events):
+            raise ValueError("Classifier must return exactly one label per event.")
+
+        # 2. Group events into a dictionary
+        grouped_events: Dict[Union[str, int], List[Event]] = {}
+        for event, label in zip(self.events, labels):
+            grouped_events.setdefault(label, []).append(event)
+
+        # 3. Return as new EventCollections
+        return {
+            label: EventCollection(events) 
+            for label, events in grouped_events.items()
+        }
 
 class EventDetector:
     def __init__(
@@ -1015,6 +1224,7 @@ def print_duration_stats(
         print(divider)
 
 
+
 ### Composites ###
 def compute_event_composite(
     events: List["Event"],
@@ -1255,4 +1465,47 @@ def plot_starting_month_distribution(
     ax.grid(axis="y", linestyle="--", alpha=0.5)
 
     plt.tight_layout()
+
+
+### Classification strategies within a Collection ###
+def classify_by_mean_threshold(
+    collection: EventCollection, 
+    variable: str = "Zea", 
+    threshold: float = -5.0
+) -> List[str]:
+    """Classifies events based on the temporal mean of a variable."""
+    labels = []
+    for event in collection.events:
+        if variable not in event.ds:
+            labels.append("Missing_Data")
+            continue
+            
+        mean_val = float(event.ds[variable].mean().values)
+        if mean_val > threshold:
+            labels.append("High_Intensity")
+        else:
+            labels.append("Low_Intensity")
+            
+    return labels
+    
+def classify_by_kmeans(
+    collection: EventCollection, 
+    variables: List[str], 
+    n_clusters: int = 3
+) -> List[int]:
+    """Clusters events using K-Means on the mean values of specified variables."""
+    # Extract tabular summary statistics
+    df = collection.to_catalog(variables=variables)
+    
+    # Construct feature matrix (e.g., taking the mean columns)
+    feature_cols = [f"{var}_mean" for var in variables]
+    features = df[feature_cols].fillna(0) # Handle missing values appropriately
+    
+    # Apply clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    labels = kmeans.fit_predict(features)
+    
+    return labels.tolist()
+
+
 #

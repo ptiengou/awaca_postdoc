@@ -1,5 +1,5 @@
 sites=['ddu','d17','d47','d85','dmc']
-sensors=['FLOWCAPT','SPC','SURF','WIND']#,'METEK']
+sensors=['FLOWCAPT','SPC','SURF','WIND','MRR']#,'METEK']
 
 prefix_to_resample_freq = {
     'FLOWCAPT':'10min',
@@ -7,7 +7,8 @@ prefix_to_resample_freq = {
     'SURF':'10min',
     'WIND':'10min',
     'METEK':'100ms',
-    'SURF_TABLE':'10min'
+    'SURF_TABLE':'10min',
+    'MRR':'10min',
 }
 
 prefix_to_acquisition_freq = {
@@ -84,6 +85,9 @@ variable_to_sensor = {
     "wdir2": "WIND",
     "wspd1_Avg": "WIND",
     "wspd2_Avg": "WIND",
+
+    #MRR
+    'precip_indicator':'MRR',
 }
 
 var_to_longname = {
@@ -146,6 +150,9 @@ var_to_longname = {
     "wdir1": "Wind Direction Level 1",
     "wspd1_Avg": "Mean Wind Speed Level 1",
     "wspd2_Avg": "Mean Wind Speed Level 2",
+
+    #MRR
+    'precip_indicator':'Fraction of vertical levels above precipitation detection threshold',
 }
 
 var_to_units = {
@@ -205,6 +212,9 @@ var_to_units = {
     "wdir1": "deg",
     "wspd1_Avg": "m s⁻¹",
     "wspd2_Avg": "m s⁻¹",
+
+    #MRR
+    'precip_indicator':'-',
 }
 
 var_to_maxval = {
