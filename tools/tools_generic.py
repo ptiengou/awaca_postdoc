@@ -277,50 +277,63 @@ def create_dict_data_datadaily(
     sensors: list,
     start_date: str,
     end_date: str,
-) -> Dict[str, Dict[str, xr.Dataset]]:
+) -> Tuple[Dict[str, xr.Dataset], Dict[str, xr.Dataset]]:
     """
     Load and resample data for all sensors and sites.
     Returns two dictionaries: `data` and `daily_data`.
     """
-    data = {}
+    data = create_data(sites, sensors, start_date, end_date)
+    return data, create_daily_data(data)
 
-    for sensor in sensors:
-        sensor_datasets = {}
-        for site in sites:
-            file_path = f'../../data/{sensor}_{site}_{start_date}_{end_date}.netcdf'
+def _qualified_variable_name(variable: str, sensor: str) -> str:
+    """Return the stable variable name used in merged site datasets."""
+    return f"{variable}_{sensor.lower()}"
 
-            if not os.path.exists(file_path):
-                print(f"File not found: {file_path}")
-                continue
+def _base_variable_name(variable: str) -> str:
+    """Recover the source variable name for metadata lookup."""
+    return variable.rsplit("_", 1)[0] if "_" in variable else variable
 
-            try:
-                ds = xr.open_dataset(file_path, engine='netcdf4')
-                sensor_datasets[site] = ds
-            except Exception as e:
-                print(f"Failed to open {file_path}: {e}")
-                continue
 
-        if sensor_datasets:
-            data[f"{sensor}"] = sensor_datasets
-            daily_datasets = {
-                name: ds.resample(time='1D').mean()
-                for name, ds in sensor_datasets.items()
-            }
-            daily_data[f"{sensor}"] = daily_datasets
+def _merge_site_dataset(
+    site: str,
+    sensor_datasets: Dict[str, xr.Dataset],
+    rename_variables: Optional[Dict[str, str]] = None,
+) -> xr.Dataset:
+    """Merge one site's sensor datasets without silently overwriting variables."""
+    merged = []
+    seen = set()
+    rename_variables = rename_variables or {}
 
-    return data, daily_data
+    for sensor, ds in sensor_datasets.items():
+        sensor_ds = ds.rename(
+            {name: rename_variables.get(name, name) for name in ds.data_vars}
+        )
+        collisions = seen.intersection(sensor_ds.data_vars)
+        if collisions:
+            names = ", ".join(sorted(collisions))
+            raise ValueError(
+                f"Variable collision at site '{site}' for sensor '{sensor}': {names}. "
+                "Pass rename_variables to disambiguate them."
+            )
+        seen.update(sensor_ds.data_vars)
+        merged.append(sensor_ds)
+
+    return xr.merge(merged, compat="no_conflicts", join="outer") if merged else xr.Dataset()
 
 def create_data(
     sites: list,
     sensors: list,
     start_date: str,
     end_date: str,
-) -> Dict[str, Dict[str, xr.Dataset]]:
+    rename_variables: Optional[Dict[str, str]] = None,
+) -> Dict[str, xr.Dataset]:
     """
-    Load raw data for all sensors and sites.
-    Returns a nested dictionary: {sensor: {site: xr.Dataset}}.
+    Load raw data and return one merged Dataset per site: {site: xr.Dataset}.
+
+    Every variable is renamed to ``<source_name>_<sensor>`` before merging,
+    which makes sensor provenance explicit and prevents collisions.
     """
-    data = {}
+    sensor_data_by_site = {site: {} for site in sites}
 
     for sensor in sensors:
         sensor_datasets = {}
@@ -333,52 +346,268 @@ def create_data(
 
             try:
                 ds = xr.open_dataset(file_path, engine='netcdf4')
-                sensor_datasets[site] = ds
+                rename_map = {
+                    name: _qualified_variable_name(name, sensor)
+                    for name in ds.data_vars
+                }
+                if rename_variables:
+                    rename_map.update(rename_variables)
+                sensor_data_by_site[site][sensor] = ds.rename(rename_map)
             except Exception as e:
                 print(f"Failed to open {file_path}: {e}")
                 continue
 
-        if sensor_datasets:
-            data[sensor] = sensor_datasets
-
-    return data
+    return {
+        site: _merge_site_dataset(site, sensor_datasets)
+        for site, sensor_datasets in sensor_data_by_site.items()
+        if sensor_datasets
+    }
     
 def create_daily_data(
-    data: Dict[str, Dict[str, xr.Dataset]]
-) -> Dict[str, Dict[str, xr.Dataset]]:
+    data: Dict[str, xr.Dataset]
+) -> Dict[str, xr.Dataset]:
     """
     Resample raw data into daily averages.
-    Returns a nested dictionary: {sensor: {site: xr.Dataset}}.
+    Returns a site-keyed dictionary: {site: xr.Dataset}.
     """
     daily_data = {}
 
-    for sensor, sensor_datasets in data.items():
-        daily_datasets = {
-            site: ds.resample(time='1D').mean()
-            for site, ds in sensor_datasets.items()
-        }
-        daily_data[sensor] = daily_datasets
+    for site, ds in data.items():
+        daily_data[site] = ds.resample(time="1D").mean()
 
     return daily_data
 
 def create_resampled_data(
-    data: Dict[str, Dict[str, xr.Dataset]],
+    data: Dict[str, xr.Dataset],
     sampling: str,
-) -> Dict[str, Dict[str, xr.Dataset]]:
+) -> Dict[str, xr.Dataset]:
     """
     Resample raw data into averages.
-    Returns a nested dictionary: {sensor: {site: xr.Dataset}}.
+    Returns a site-keyed dictionary: {site: xr.Dataset}.
     """
     sampled_data = {}
 
-    for sensor, sensor_datasets in data.items():
-        sampled_datasets = {
-            site: ds.resample(time=sampling).mean()
-            for site, ds in sensor_datasets.items()
-        }
-        sampled_data[sensor] = sampled_datasets
+    for site, ds in data.items():
+        sampled_data[site] = ds.resample(time=sampling).mean()
 
     return sampled_data
+
+def merge_site_variables(
+    data: Dict[str, xr.Dataset],
+    sites: Optional[Sequence[str]] = None,
+    first_variable: str = "wspd1_surf",
+    second_variable: str = "wspd1_wind",
+    merged_variable: str = "wspd1_merged",
+    drop_source_variables: bool = False,
+) -> Dict[str, xr.Dataset]:
+    """Merge two time-series variables in selected site datasets.
+
+    The second variable has priority where both variables contain observations;
+    the first variable fills gaps. This is useful when two sensors cover
+    complementary periods, such as ``wspd1_surf`` and ``wspd1_wind``.
+
+    Parameters
+    ----------
+    data : Dict[str, xr.Dataset]
+        Site-keyed datasets in the form ``{site: xr.Dataset}``.
+    sites : Sequence[str], optional
+        Sites to update. If omitted, all sites containing at least one source
+        variable are considered.
+    first_variable : str
+        Fallback variable used where ``second_variable`` is missing.
+    second_variable : str
+        Primary variable used where both source variables overlap.
+    merged_variable : str
+        Name assigned to the merged DataArray.
+    drop_source_variables : bool
+        If True, remove both source variables from the returned datasets.
+
+    Returns
+    -------
+    Dict[str, xr.Dataset]
+        A copied site-keyed dictionary with ``merged_variable`` added for each
+        site where both source variables are present.
+
+    Raises
+    ------
+    KeyError
+        If an explicitly requested site does not contain both source variables.
+    """
+    selected_sites = list(sites) if sites is not None else list(data)
+    merged_data = {site: ds.copy() for site, ds in data.items()}
+
+    for site in selected_sites:
+        if site not in merged_data:
+            raise KeyError(f"Site '{site}' is not present in data.")
+
+        ds = merged_data[site]
+        missing = [
+            variable
+            for variable in (first_variable, second_variable)
+            if variable not in ds
+        ]
+        if missing:
+            raise KeyError(
+                f"Site '{site}' is missing source variable(s): {', '.join(missing)}"
+            )
+
+        fallback, primary = xr.align(
+            ds[first_variable], ds[second_variable], join="outer"
+        )
+        merged = primary.combine_first(fallback)
+        merged.name = merged_variable
+        merged.attrs = dict(primary.attrs)
+        merged.attrs.setdefault(
+            "description",
+            f"{second_variable} with gaps filled from {first_variable}",
+        )
+        merged_data[site][merged_variable] = merged
+
+        if drop_source_variables:
+            merged_data[site] = merged_data[site].drop_vars(
+                [first_variable, second_variable]
+            )
+
+    return merged_data
+
+def add_wind_beginning_data(
+    data: Dict[str, xr.Dataset],
+    sites: Sequence[str],
+    data_folder_path: str = "../../data",
+    start_date: str = "20241201",
+    end_date: str = "20250313",
+    variables: Sequence[str] = ("wspd1", "wspd2", "wspd3", "wdir"),
+    engine: Optional[str] = "netcdf4",
+    strict: bool = False,
+) -> Dict[str, xr.Dataset]:
+    """Add observations from the early WIND files to site-keyed datasets.
+
+    The early observations are stored separately in files named
+    ``WIND_BEGINNING_<site>_<start_date>_<end_date>.netcdf``. Existing
+    ``<variable>_wind`` observations take priority; values from the beginning
+    file fill only missing timestamps. This reproduces the previous notebook
+    workflow without the old sensor/site nesting.
+
+    Parameters
+    ----------
+    data : Dict[str, xr.Dataset]
+        Site-keyed datasets returned by :func:`create_data`.
+    sites : Sequence[str]
+        Sites whose beginning WIND files should be loaded.
+    data_folder_path : str
+        Directory containing the ``WIND_BEGINNING`` files.
+    start_date, end_date : str
+        Date strings used in the beginning-file name.
+    variables : Sequence[str]
+        Unqualified variables to copy and qualify with ``_wind``.
+    engine : str, optional
+        Engine passed to :func:`xarray.open_dataset`.
+    strict : bool
+        If True, raise for missing files, sites, or variables. Otherwise print
+        warnings and continue with the available data.
+
+    Returns
+    -------
+    Dict[str, xr.Dataset]
+        A copied site-keyed dictionary containing the backfilled WIND data.
+    """
+    result = {site: ds.copy() for site, ds in data.items()}
+
+    for site in sites:
+        if site not in result:
+            message = f"Site '{site}' is not present in data."
+            if strict:
+                raise KeyError(message)
+            print(f"[WARNING] {message}")
+            continue
+
+        file_path = (
+            Path(data_folder_path)
+            / f"WIND_BEGINNING_{site}_{start_date}_{end_date}.netcdf"
+        )
+        if not file_path.exists():
+            message = f"Beginning WIND file not found: {file_path}"
+            if strict:
+                raise FileNotFoundError(message)
+            print(f"[WARNING] {message}")
+            continue
+
+        open_kwargs = {"engine": engine} if engine is not None else {}
+        with xr.open_dataset(file_path, **open_kwargs) as beginning_ds:
+            beginning_ds = beginning_ds.load()
+            site_ds = result[site]
+
+            for variable in variables:
+                if variable not in beginning_ds:
+                    message = f"Variable '{variable}' not found in {file_path}"
+                    if strict:
+                        raise KeyError(message)
+                    print(f"[WARNING] {message}")
+                    continue
+
+                qualified_name = _qualified_variable_name(variable, "WIND")
+                beginning_da = beginning_ds[variable].rename(qualified_name)
+                if qualified_name in site_ds:
+                    existing_da, beginning_da = xr.align(
+                        site_ds[qualified_name], beginning_da, join="outer"
+                    )
+                    site_ds[qualified_name] = existing_da.combine_first(beginning_da)
+                else:
+                    site_ds[qualified_name] = beginning_da
+
+            result[site] = site_ds
+
+    return result
+
+def add_variable_to_data(
+    data: Dict[str, xr.Dataset],
+    site: str,
+    data_array: xr.DataArray,
+    variable_name: Optional[str] = None,
+    overwrite: bool = False,
+) -> Dict[str, xr.Dataset]:
+    """Add one derived or external variable to a site-keyed data dictionary.
+
+    The returned dictionary is copied; the input dictionary is not modified.
+    Xarray aligns a DataArray with the site's coordinates when it is assigned,
+    so variables with different sampling intervals can be added safely.
+
+    Parameters
+    ----------
+    data : Dict[str, xr.Dataset]
+        Site-keyed datasets in the form ``{site: xr.Dataset}``.
+    site : str
+        Site receiving the variable.
+    data_array : xr.DataArray
+        Derived or external time series to add.
+    variable_name : str, optional
+        Name stored in the site's Dataset. Defaults to ``data_array.name``.
+    overwrite : bool
+        Whether to replace an existing variable with the same name.
+
+    Returns
+    -------
+    Dict[str, xr.Dataset]
+        A copied data dictionary containing the added variable.
+    """
+    if site not in data:
+        raise KeyError(f"Site '{site}' is not present in data.")
+    if not isinstance(data_array, xr.DataArray):
+        raise TypeError("data_array must be an xarray.DataArray.")
+
+    target_name = variable_name or data_array.name
+    if not target_name:
+        raise ValueError("variable_name is required when data_array has no name.")
+
+    if target_name in data[site] and not overwrite:
+        raise ValueError(
+            f"Variable '{target_name}' already exists at site '{site}'. "
+            "Pass overwrite=True to replace it."
+        )
+
+    result = {current_site: ds.copy() for current_site, ds in data.items()}
+    result[site][target_name] = data_array.rename(target_name)
+    return result
 
 def filter_data_by_max_values(data: dict, variables: list):
     """
@@ -387,7 +616,7 @@ def filter_data_by_max_values(data: dict, variables: list):
     Existing NaN values are preserved.
 
     Args:
-        data (dict): Dictionary of the form {sensor: {site: xarray.Dataset}}.
+        data (dict): Dictionary of the form {site: xarray.Dataset}.
         variables (list): List of variables to filter.
 
     Returns:
@@ -395,30 +624,29 @@ def filter_data_by_max_values(data: dict, variables: list):
     """
     filtered_data = {}
 
-    for sensor, sites in data.items():
-        filtered_data[sensor] = {}
-        for site, ds in sites.items():
-            filtered_ds = ds.copy()
-            for variable in variables:
-                if variable in var_to_maxval and variable in filtered_ds:
-                    max_val = var_to_maxval[variable]
-                    # Replace values > max_val with NaN, preserving existing NaNs
+    for site, ds in data.items():
+        filtered_ds = ds.copy()
+        for variable in variables:
+            base_variable = _base_variable_name(variable)
+            if variable in filtered_ds:
+                max_val = var_to_maxval.get(variable, var_to_maxval.get(base_variable))
+                if max_val is not None:
                     filtered_ds[variable] = filtered_ds[variable].where(
-                        (filtered_ds[variable] <= max_val) | (np.isnan(filtered_ds[variable]))
+                        (filtered_ds[variable] <= max_val) | np.isnan(filtered_ds[variable])
                     )
-            filtered_data[sensor][site] = filtered_ds
+        filtered_data[site] = filtered_ds
 
     return filtered_data
 
 def filter_datasets_golden(
-    ds_dict: dict[str, dict[str, xr.Dataset]], start_date: str, end_date: str
-) -> dict[str, dict[str, xr.Dataset]]:
-    """Slice a nested dictionary of xarray Datasets {sensor: {site: ds}} between two dates.
+    ds_dict: dict[str, xr.Dataset], start_date: str, end_date: str
+) -> dict[str, xr.Dataset]:
+    """Slice site-keyed xarray Datasets between two dates.
 
     Parameters
     ----------
-    ds_dict : dict[str, dict[str, xr.Dataset]]
-        Nested dictionary where top-level keys are sensors and inner keys are sites.
+    ds_dict : dict[str, xr.Dataset]
+        Site-keyed dictionary containing one merged Dataset per site.
     start_date : str
         Start date formatted as 'YYYY-MM-DD' (or ISO string).
     end_date : str
@@ -426,46 +654,32 @@ def filter_datasets_golden(
 
     Returns
     -------
-    dict[str, dict[str, xr.Dataset]]
-        Nested dictionary containing the temporally sliced Datasets.
+    dict[str, xr.Dataset]
+        Site-keyed dictionary containing the temporally sliced Datasets.
     """
     return {
-        sensor: {
-            site: ds.sel(
-                {
-                    ("time" if "time" in ds.coords else "t"): slice(
-                        start_date, end_date
-                    )
-                }
-            )
-            for site, ds in sites.items()
-        }
-        for sensor, sites in ds_dict.items()
+        site: ds.sel({("time" if "time" in ds.coords else "t"): slice(start_date, end_date)})
+        for site, ds in ds_dict.items()
     }
 
 def extract_variable_series(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    site_datasets: Dict[str, xr.Dataset],
     variable: str,
     site: str,
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
 ) -> Optional[xr.DataArray]:
     """
-    Extracts a specific variable DataArray for a given site from the nested
-    sensor_datasets structure {sensor: {site: Dataset}}.
+    Extract a variable from a site-keyed dataset dictionary.
     """
-    sensor = variable_to_sensor.get(variable)
-    if sensor and site in sensor_datasets.get(sensor, {}):
-        ds = sensor_datasets[sensor][site]
-        if variable in ds:
-            return ds[variable]
+    ds = site_datasets.get(site)
+    if ds is not None and variable in ds:
+        return ds[variable]
     return None
 
 def extract_site_dataset(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    site_datasets: Dict[str, xr.Dataset],
     site: str,
     trigger_variable: str = "FluxMean2",
     variables: Optional[List[str]] = None,
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
     tolerance: Optional[str] = "10min",  # Max allowable shift when matching timestamps
 ) -> xr.Dataset:
     """
@@ -473,14 +687,13 @@ def extract_site_dataset(
     the primary trigger_variable. Secondary variables are aligned to the trigger 
     time axis via nearest-neighbor matching.
     """
-    target_vars = variables if variables is not None else list(variable_to_sensor.keys())
+    target_vars = variables if variables is not None else list(site_datasets.get(site, {}).data_vars)
     
     # 1. Retrieve the primary trigger DataArray first
     trigger_da = extract_variable_series(
-        sensor_datasets=sensor_datasets,
+        site_datasets=site_datasets,
         variable=trigger_variable,
         site=site,
-        variable_to_sensor=variable_to_sensor,
     )
     
     if trigger_da is None:
@@ -494,10 +707,9 @@ def extract_site_dataset(
             continue
             
         da = extract_variable_series(
-            sensor_datasets=sensor_datasets,
+            site_datasets=site_datasets,
             variable=var,
             site=site,
-            variable_to_sensor=variable_to_sensor,
         )
         if da is not None:
             # Match nearest timestamps within tolerance without dropping trigger timesteps
@@ -616,7 +828,7 @@ def compute_vertical_over_threshold_fraction(
                 f"Variable '{var_name}' not found in the provided Dataset."
             )
         da = ds_or_da[var_name]
-    elif isinstance(da_or_ds, xr.DataArray):
+    elif isinstance(ds_or_da, xr.DataArray):
         da = ds_or_da
         var_name = da.name or var_name
     else:
@@ -657,33 +869,16 @@ def compute_vertical_over_threshold_fraction(
 
 ## STATS ##
 def compute_variable_stats(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    site_datasets: Dict[str, xr.Dataset],
     variable: str,
-    sites: Optional[List[str]] = sites
+    sites: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """
-    Compute statistics for a specific variable across all sites and sensors.
-
-    Args:
-        sensor_datasets: Nested dictionary of datasets structured as {sensor: {site: dataset}}.
-        variable: Variable name to compute statistics for.
-        variable_to_sensor: Dictionary mapping variables to their respective sensors.
-        sites: Optional list of site names to include. If None, all sites are included.
-
-    Returns:
-        A pandas DataFrame with statistics for the variable across all specified sites.
-    """
+    """Compute statistics for a variable across site-keyed datasets."""
     stats = []
 
-    # Find the sensor for the variable
-    sensor = variable_to_sensor.get(variable)
-    if sensor is None:
-        raise ValueError(f"Variable '{variable}' not found in variable_to_sensor.")
-
-    # Iterate over all sites in the sensor's datasets
-    for site, ds in sensor_datasets.get(sensor, {}).items():
+    for site, ds in site_datasets.items():
         if sites is not None and site not in sites:
-            continue  # Skip if site is not in the provided list
+            continue
 
         if variable in ds:
             data = ds[variable].values
@@ -706,7 +901,6 @@ def compute_variable_stats(
 def plot_binned_distribution(
     data: dict,
     variable: str,
-    variable_to_sensor: dict,
     bin_number: int = 20,
     min_value: float = None,
     max_value: float = None,
@@ -715,32 +909,25 @@ def plot_binned_distribution(
     Plot a binned distribution for each site in the data dictionary.
 
     Args:
-        data (dict): Dictionary of the form {sensor: {site: xarray.Dataset}}.
-        variable (str): The variable to plot.
-        variable_to_sensor (dict): Dictionary mapping variables to sensors.
+        data (dict): Dictionary of the form {site: xarray.Dataset}.
+        variable (str): The qualified variable to plot.
         bin_number (int): Number of bins (default: 20).
         min_value (float): Minimum value for bins (default: rounded min of data).
         max_value (float): Maximum value for bins (default: rounded max of data).
     """
-    # Determine the sensor for the variable
-    sensor = variable_to_sensor.get(variable)
-    if sensor is None:
-        raise ValueError(f"No sensor found for variable: {variable}")
-
-    # Get the datasets for the sensor
-    sensor_data = data.get(sensor)
-    if sensor_data is None:
-        raise ValueError(f"No data found for sensor: {sensor}")
-
     # Extract non-NaN values for the variable across all sites
     all_values = []
-    for site, ds in sensor_data.items():
+    site_data = {}
+    for site, ds in data.items():
         if variable in ds:
             values = ds[variable].values.flatten()
-            all_values.extend(values[~np.isnan(values)])
+            valid_values = values[~np.isnan(values)]
+            if valid_values.size:
+                all_values.extend(valid_values)
+                site_data[site] = valid_values
 
     if not all_values:
-        raise ValueError(f"No non-NaN data found for variable {variable} in sensor {sensor}")
+        raise ValueError(f"No non-NaN data found for variable {variable}")
 
     # Calculate min and max if not provided
     if min_value is None:
@@ -752,35 +939,29 @@ def plot_binned_distribution(
     bins = np.linspace(min_value, max_value, bin_number + 1)
 
     # Create subplots
-    num_sites = len(sensor_data)
+    num_sites = len(site_data)
     fig, axes = plt.subplots(nrows=num_sites, ncols=1, figsize=(5, 3 * num_sites))
     if num_sites == 1:
         axes = [axes]
 
-    for ax, (site, ds) in zip(axes, sensor_data.items()):
-        if variable in ds:
-            values = ds[variable].values.flatten()
-            values = values[~np.isnan(values)]  # Filter out NaN values
+    for ax, (site, values) in zip(axes, site_data.items()):
+        counts, _ = np.histogram(values, bins=bins)
+        percentages = (counts / len(values)) * 100
+        ax.bar(bins[:-1], percentages, width=np.diff(bins), align='edge', alpha=0.7, label=site)
 
-            # Plot histogram with normalized frequency (percentage)
-            counts, _ = np.histogram(values, bins=bins)
-            percentages = (counts / len(values)) * 100
-            ax.bar(bins[:-1], percentages, width=np.diff(bins), align='edge', alpha=0.7, label=site)
-
-            ax.set_title(f"Distribution of {variable} for {site}")
-            ax.set_xlabel(variable)
-            ax.set_ylabel("Frequency (%)")
-            ax.set_ylim(0, 100)
-            ax.legend()
+        ax.set_title(f"Distribution of {variable} for {site}")
+        ax.set_xlabel(variable)
+        ax.set_ylabel("Frequency (%)")
+        ax.set_ylim(0, 100)
+        ax.legend()
 
     plt.tight_layout()
     plt.show()
 
 def plot_binary_availability_for_sites(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    sensor_datasets: Dict[str, xr.Dataset],
     variables: List[str],
     sites: List[str],
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
     var_to_units: Optional[Dict[str, str]] = var_to_units,
     var_to_longname: Optional[Dict[str, str]] = var_to_longname,
     figsize: Tuple[int, int] = (15, 5),
@@ -792,10 +973,9 @@ def plot_binary_availability_for_sites(
     Each subplot corresponds to a variable, and the legend indicates the site.
 
     Args:
-        sensor_datasets: Nested dictionary of datasets structured as {sensor: {site: dataset}}.
+        site_datasets: Dictionary of datasets structured as {site: dataset}.
         variables: List of variable names to plot.
         sites: List of site names to include in the plot.
-        variable_to_sensor: Dictionary mapping variables to their respective sensors.
         var_to_units: Dictionary mapping variables to their unit strings.
         var_to_longname: Dictionary mapping variables to their descriptive long names.
         figsize: Figure size for each subplot (width, height). Default: (15, 5).
@@ -804,9 +984,6 @@ def plot_binary_availability_for_sites(
     """
     if not sensor_datasets or not variables or not sites:
         raise ValueError("No datasets, variables, or sites provided.")
-
-    if variable_to_sensor is None:
-        raise ValueError("variable_to_sensor dictionary is required.")
 
     if colors is not None and len(colors) != len(sites):
         raise ValueError("Length of colors must match the number of sites.")
@@ -818,21 +995,12 @@ def plot_binary_availability_for_sites(
         axes = [axes]
 
     for ax, var in zip(axes, variables):
-        sensor = variable_to_sensor.get(var)
-        if sensor is None:
-            print(f"Warning: Variable '{var}' not found in variable_to_sensor. Skipping.")
-            continue
-
         for i, site in enumerate(sites):
-            if site in sensor_datasets.get(sensor, {}):
-                ds = sensor_datasets[sensor][site]
-                if var in ds:
-                    # Create binary mask: 1 for non-NaN, 0 for NaN
-                    binary_data = (~np.isnan(ds[var])).astype(int)
-
-                    # Plot binary data
-                    site_color = colors[i] if colors else None
-                    binary_data.plot(ax=ax, label=f"{site}", color=site_color, **plot_kwargs)
+            ds = sensor_datasets.get(site)
+            if ds is not None and var in ds:
+                binary_data = (~np.isnan(ds[var])).astype(int)
+                site_color = colors[i] if colors else None
+                binary_data.plot(ax=ax, label=f"{site}", color=site_color, **plot_kwargs)
 
         # Retrieve metadata for titles and labels
         long_name = (var_to_longname or {}).get(var, var)
@@ -846,7 +1014,7 @@ def plot_binary_availability_for_sites(
     plt.tight_layout()
 
 def plot_monthly_availability_table(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    sensor_datasets: Dict[str, xr.Dataset],
     variables: List[str],
     sites: List[str],
     var_to_longname: Optional[Dict[str, str]] = None,
@@ -868,21 +1036,11 @@ def plot_monthly_availability_table(
     availability_records = {}
 
     for var in variables:
-        sensor = variable_to_sensor.get(var)
-        if not sensor or sensor not in sensor_datasets:
-            print(
-                f"Warning: Variable '{var}' or sensor '{sensor}' missing. Skipping."
-            )
-            continue
-
         var_label = (var_to_longname or {}).get(var, var)
 
         for site in sites:
-            if site not in sensor_datasets[sensor]:
-                continue
-
-            ds = sensor_datasets[sensor][site]
-            if var not in ds:
+            ds = sensor_datasets.get(site)
+            if ds is None or var not in ds:
                 continue
 
             da = ds[var]
@@ -1146,10 +1304,9 @@ def format_time_plot(
     return ax
 
 def plot_per_site_multiple_vars(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    sensor_datasets: Dict[str, xr.Dataset],
     variables: List[str],
     sites: List[str],
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
     var_to_units: Optional[Dict[str, str]] = None,
     var_to_longname: Optional[Dict[str, str]] = None,
     figsize: Tuple[int, int] = (15, 3),
@@ -1164,9 +1321,6 @@ def plot_per_site_multiple_vars(
     if not sensor_datasets or not variables or not sites:
         raise ValueError("No datasets, variables, or sites provided.")
 
-    if variable_to_sensor is None:
-        raise ValueError("variable_to_sensor dictionary is required.")
-
     n_sites = len(sites)
     fig, axes = plt.subplots(n_sites, 1, figsize=(figsize[0], figsize[1] * n_sites), sharex=True, sharey=True)
     if n_sites == 1:
@@ -1178,7 +1332,7 @@ def plot_per_site_multiple_vars(
     if global_min is None:
         for site in sites:
             for var in variables:
-                da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+                da = extract_variable_series(sensor_datasets, var, site)
                 if da is not None:
                     v_min = float(da.min().values)
                     global_min = v_min if global_min is None else min(global_min, v_min)
@@ -1186,7 +1340,7 @@ def plot_per_site_multiple_vars(
     if global_max is None:
         for site in sites:
             for var in variables:
-                da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+                da = extract_variable_series(sensor_datasets, var, site)
                 if da is not None:
                     v_max = float(da.max().values)
                     global_max = v_max if global_max is None else max(global_max, v_max)
@@ -1194,7 +1348,7 @@ def plot_per_site_multiple_vars(
     # Plot variables site by site
     for ax, site in zip(axes, sites):
         for var in variables:
-            da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+            da = extract_variable_series(sensor_datasets, var, site)
             if da is not None:
                 long_name = (var_to_longname or {}).get(var, var)
                 unit = (var_to_units or {}).get(var, "")
@@ -1216,10 +1370,9 @@ def plot_per_site_multiple_vars(
     plt.tight_layout()
 
 def plot_per_var_multiple_sites(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    sensor_datasets: Dict[str, xr.Dataset],
     variables: List[str],
     sites: List[str],
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
     var_to_units: Optional[Dict[str, str]] = None,
     var_to_longname: Optional[Dict[str, str]] = None,
     figsize: Tuple[int, int] = (15, 5),
@@ -1234,9 +1387,6 @@ def plot_per_var_multiple_sites(
     """
     if not sensor_datasets or not variables or not sites:
         raise ValueError("No datasets, variables, or sites provided.")
-
-    if variable_to_sensor is None:
-        raise ValueError("variable_to_sensor dictionary is required.")
 
     if ymin is not None and len(ymin) != len(variables):
         raise ValueError("Length of ymin must match the number of variables.")
@@ -1255,30 +1405,26 @@ def plot_per_var_multiple_sites(
 
     # Plot variable by variable across all sites
     for ax, var, user_ymin, user_ymax in zip(axes, variables, y_mins, y_maxs):
-        sensor = variable_to_sensor.get(var)
-        if sensor is None:
-            continue
-
         # Compute per-variable limits independently if not user-defined
         calc_ymin, calc_ymax = user_ymin, user_ymax
 
         if calc_ymin is None:
             for site in sites:
-                da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+                da = extract_variable_series(sensor_datasets, var, site)
                 if da is not None:
                     v_min = float(da.min().values)
                     calc_ymin = v_min if calc_ymin is None else min(calc_ymin, v_min)
 
         if calc_ymax is None:
             for site in sites:
-                da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+                da = extract_variable_series(sensor_datasets, var, site)
                 if da is not None:
                     v_max = float(da.max().values)
                     calc_ymax = v_max if calc_ymax is None else max(calc_ymax, v_max)
 
         # Plot each site for the given variable
         for i, site in enumerate(sites):
-            da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+            da = extract_variable_series(sensor_datasets, var, site)
             if da is not None:
                 site_color = colors[i] if colors else None
                 long_name = (var_to_longname or {}).get(var, var)
@@ -1423,9 +1569,8 @@ def format_scatter_plot(
     return ax, cbar
 
 def align_and_clean_data(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    site_datasets: Dict[str, xr.Dataset],
     vars_and_sites: Sequence[Tuple[str, str]],
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
 ) -> List[np.ndarray]:
     """
     Extracts, temporally aligns, flattens, and removes NaN/non-finite values
@@ -1433,7 +1578,7 @@ def align_and_clean_data(
     """
     das = []
     for var, site in vars_and_sites:
-        da = extract_variable_series(sensor_datasets, var, site, variable_to_sensor)
+        da = extract_variable_series(site_datasets, var, site)
         if da is None:
             raise KeyError(f"Variable '{var}' at site '{site}' could not be retrieved.")
         das.append(da)
@@ -1457,12 +1602,11 @@ def align_and_clean_data(
     return cleaned_arrays
 
 def plot_bivariate_scatter(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    site_datasets: Dict[str, xr.Dataset],
     var1: str,
     var2: str,
     site1: str,
     site2: str,
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
     var_to_units: Optional[Dict[str, str]] = None,
     var_to_longname: Optional[Dict[str, str]] = None,
     min_val: Optional[List[Optional[float]]] = None,
@@ -1481,7 +1625,7 @@ def plot_bivariate_scatter(
 
     # 1. Align and Clean
     x_clean, y_clean = align_and_clean_data(
-        sensor_datasets, [(var1, site1), (var2, site2)], variable_to_sensor
+        site_datasets, [(var1, site1), (var2, site2)]
     )
 
     # 2. Metadata Labels
@@ -1513,14 +1657,13 @@ def plot_bivariate_scatter(
     plt.tight_layout()
 
 def plot_trivariate_scatter(
-    sensor_datasets: Dict[str, Dict[str, xr.Dataset]],
+    site_datasets: Dict[str, xr.Dataset],
     var1: str,
     var2: str,
     var3: str,
     site1: str,
     site2: str,
     site3: str,
-    variable_to_sensor: Dict[str, str] = variable_to_sensor,
     var_to_units: Optional[Dict[str, str]] = None,
     var_to_longname: Optional[Dict[str, str]] = None,
     min_val: Optional[List[Optional[float]]] = None,
@@ -1548,7 +1691,7 @@ def plot_trivariate_scatter(
 
     # 1. Align and Clean
     x_clean, y_clean, c_clean = align_and_clean_data(
-        sensor_datasets, [(var1, site1), (var2, site2), (var3, site3)], variable_to_sensor
+        site_datasets, [(var1, site1), (var2, site2), (var3, site3)]
     )
 
     # 2. Metadata Labels

@@ -591,16 +591,14 @@ class EventDetector:
         threshold: float = 1.0,
         min_timesteps: int = 24,
         buffer_timesteps: int = 2,
-        variable_to_sensor: Dict[str, str] = variable_to_sensor,
     ):
         self.threshold = threshold
         self.min_timesteps = min_timesteps
         self.buffer_timesteps = buffer_timesteps
-        self.variable_to_sensor = variable_to_sensor
 
     def detect_events(
         self,
-        data: Dict[str, Dict[str, xr.Dataset]],
+        data: Dict[str, xr.Dataset],
         variable: str,
         additional_variables: Optional[List[str]] = None,
     ) -> "EventCollection":
@@ -608,19 +606,16 @@ class EventDetector:
         target_vars = [variable] + (additional_variables or [])
         global_event_id = 0
 
-        # Unique set of sites across all sensor datasets
-        sites = set(site for sensor_dict in data.values() for site in sensor_dict)
-
-        for site_id in sites:
-            # 1. Merge all sensor datasets for this site into a single aligned dataset
+        for site_id in data:
+            # Data is already merged by site; only align the requested variables.
             merged_ds = extract_site_dataset(
-                sensor_datasets=data,
+                site_datasets=data,
                 site=site_id,
+                trigger_variable=variable,
                 variables=target_vars,
-                variable_to_sensor=self.variable_to_sensor,
             )
 
-            if merged_ds == xr.Dataset() or variable not in merged_ds:
+            if not merged_ds.data_vars or variable not in merged_ds:
                 continue
 
             da_trigger = merged_ds[variable]
@@ -654,7 +649,7 @@ class EventDetector:
 
     def detect_non_events(
     self,
-    data: Dict[str, Dict[str, xr.Dataset]],
+    data: Dict[str, xr.Dataset],
     variable: str,
     additional_variables: Optional[List[str]] = None,
     ) -> "EventCollection":
@@ -663,8 +658,9 @@ class EventDetector:
 
         Parameters
         ----------
-        data : Dict[str, Dict[str, xr.Dataset]]
-            Nested dictionary of sensor datasets structured as {sensor: {site: dataset}}.
+        data : Dict[str, xr.Dataset]
+            Site-keyed dictionary of merged datasets structured as
+            ``{site: xr.Dataset}``.
         variable : str
             Trigger variable name evaluated against the threshold.
         additional_variables : Optional[List[str]]
@@ -679,17 +675,15 @@ class EventDetector:
         target_vars = [variable] + (additional_variables or [])
         global_event_id = 0
 
-        sites = set(site for sensor_dict in data.values() for site in sensor_dict)
-
-        for site_id in sites:
+        for site_id in data:
             merged_ds = extract_site_dataset(
-                sensor_datasets=data,
+                site_datasets=data,
                 site=site_id,
+                trigger_variable=variable,
                 variables=target_vars,
-                variable_to_sensor=self.variable_to_sensor,
             )
 
-            if merged_ds == xr.Dataset() or variable not in merged_ds:
+            if not merged_ds.data_vars or variable not in merged_ds:
                 continue
 
             da_trigger = merged_ds[variable]
