@@ -36,6 +36,8 @@ import scipy.ndimage
 from collections import defaultdict
 from functools import partial
 from sklearn.cluster import KMeans
+import re
+import warnings
 
 
 #import psyplot.project as psy

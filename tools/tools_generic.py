@@ -285,6 +285,105 @@ def create_dict_data_datadaily(
     data = create_data(sites, sensors, start_date, end_date)
     return data, create_daily_data(data)
 
+
+def _default_data_folder_path() -> Path:
+    """Return the repository data directory independently of the cwd."""
+    return Path(__file__).resolve().parents[2] / "data"
+
+
+def _load_sensor_data(
+    data: Dict[str, xr.Dataset],
+    site_list: Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+    sensor: str,
+    data_folder_path: Optional[str | Path] = None,
+) -> Dict[str, xr.Dataset]:
+    """Add one root-level sensor file per site to a site-keyed data dictionary."""
+    data_folder = (
+        Path(data_folder_path)
+        if data_folder_path is not None
+        else _default_data_folder_path()
+    )
+    result = {site: ds.copy() for site, ds in data.items()}
+
+    for site in site_list:
+        file_path = data_folder / f"{sensor}_{site}_{file_start_date}_{file_end_date}.netcdf"
+        if not file_path.exists():
+            print(f"[WARNING] File not found: {file_path}")
+            continue
+
+        try:
+            with xr.open_dataset(file_path, engine="netcdf4") as source:
+                sensor_ds = source.load()
+            sensor_ds = sensor_ds.rename({
+                name: _qualified_variable_name(name, sensor)
+                for name in sensor_ds.data_vars
+            })
+            if site in result:
+                result[site] = xr.merge(
+                    [result[site], sensor_ds], compat="no_conflicts", join="outer"
+                )
+            else:
+                result[site] = sensor_ds
+        except Exception as exc:
+            print(f"[WARNING] Failed to open {file_path}: {exc}")
+
+    return result
+
+
+def load_wind_data(
+    data: Dict[str, xr.Dataset],
+    site_list: Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+) -> Dict[str, xr.Dataset]:
+    """Add WIND data and backfill it with the early WIND files."""
+    result = _load_sensor_data(
+        data, site_list, file_start_date, file_end_date, sensor="WIND"
+    )
+    return add_wind_beginning_data(result, site_list)
+
+
+def load_surf_data(
+    data: Dict[str, xr.Dataset],
+    site_list: Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+) -> Dict[str, xr.Dataset]:
+    """Add SURF data to the site-keyed data dictionary."""
+    return _load_sensor_data(data, site_list, file_start_date, file_end_date, "SURF")
+
+
+def load_metek_data(
+    data: Dict[str, xr.Dataset],
+    site_list: Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+) -> Dict[str, xr.Dataset]:
+    """Add METEK data to the site-keyed data dictionary."""
+    return _load_sensor_data(data, site_list, file_start_date, file_end_date, "METEK")
+
+
+def load_flowcapt_data(
+    data: Dict[str, xr.Dataset],
+    site_list: Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+) -> Dict[str, xr.Dataset]:
+    """Add FLOWCAPT data to the site-keyed data dictionary."""
+    return _load_sensor_data(data, site_list, file_start_date, file_end_date, "FLOWCAPT")
+
+
+def load_spc_data(
+    data: Dict[str, xr.Dataset],
+    site_list: Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+) -> Dict[str, xr.Dataset]:
+    """Add SPC data to the site-keyed data dictionary."""
+    return _load_sensor_data(data, site_list, file_start_date, file_end_date, "SPC")
+
 def _qualified_variable_name(variable: str, sensor: str) -> str:
     """Return the stable variable name used in merged site datasets."""
     return f"{variable}_{sensor.lower()}"
@@ -333,35 +432,27 @@ def create_data(
     Every variable is renamed to ``<source_name>_<sensor>`` before merging,
     which makes sensor provenance explicit and prevents collisions.
     """
-    sensor_data_by_site = {site: {} for site in sites}
-
-    for sensor in sensors:
-        sensor_datasets = {}
-        for site in sites:
-            file_path = f'../../data/{sensor}_{site}_{start_date}_{end_date}.netcdf'
-
-            if not os.path.exists(file_path):
-                print(f"File not found: {file_path}")
-                continue
-
-            try:
-                ds = xr.open_dataset(file_path, engine='netcdf4')
-                rename_map = {
-                    name: _qualified_variable_name(name, sensor)
-                    for name in ds.data_vars
-                }
-                if rename_variables:
-                    rename_map.update(rename_variables)
-                sensor_data_by_site[site][sensor] = ds.rename(rename_map)
-            except Exception as e:
-                print(f"Failed to open {file_path}: {e}")
-                continue
-
-    return {
-        site: _merge_site_dataset(site, sensor_datasets)
-        for site, sensor_datasets in sensor_data_by_site.items()
-        if sensor_datasets
+    loaders = {
+        "WIND": load_wind_data,
+        "SURF": load_surf_data,
+        "METEK": load_metek_data,
+        "FLOWCAPT": load_flowcapt_data,
+        "SPC": load_spc_data,
     }
+    data: Dict[str, xr.Dataset] = {}
+    for sensor in sensors:
+        loader = loaders.get(sensor)
+        if loader is None:
+            print(f"[WARNING] No incremental loader is available for {sensor}.")
+            continue
+        data = loader(data, sites, start_date, end_date)
+
+    if rename_variables:
+        data = {
+            site: ds.rename(rename_variables)
+            for site, ds in data.items()
+        }
+    return data
     
 def create_daily_data(
     data: Dict[str, xr.Dataset]
@@ -473,7 +564,7 @@ def merge_site_variables(
 def add_wind_beginning_data(
     data: Dict[str, xr.Dataset],
     sites: Sequence[str],
-    data_folder_path: str = "../../data",
+    data_folder_path: Optional[str] = None,
     start_date: str = "20241201",
     end_date: str = "20250313",
     variables: Sequence[str] = ("wspd1", "wspd2", "wspd3", "wdir"),
@@ -511,6 +602,11 @@ def add_wind_beginning_data(
     Dict[str, xr.Dataset]
         A copied site-keyed dictionary containing the backfilled WIND data.
     """
+    data_folder = (
+        Path(data_folder_path)
+        if data_folder_path is not None
+        else _default_data_folder_path()
+    )
     result = {site: ds.copy() for site, ds in data.items()}
 
     for site in sites:
@@ -522,7 +618,7 @@ def add_wind_beginning_data(
             continue
 
         file_path = (
-            Path(data_folder_path)
+            data_folder
             / f"WIND_BEGINNING_{site}_{start_date}_{end_date}.netcdf"
         )
         if not file_path.exists():
@@ -565,12 +661,17 @@ def add_variable_to_data(
     data_array: xr.DataArray,
     variable_name: Optional[str] = None,
     overwrite: bool = False,
+    log_variable: bool = False,
+    tolerance: Optional[str] = "15min",
 ) -> Dict[str, xr.Dataset]:
     """Add one derived or external variable to a site-keyed data dictionary.
 
     The returned dictionary is copied; the input dictionary is not modified.
-    Xarray aligns a DataArray with the site's coordinates when it is assigned,
-    so variables with different sampling intervals can be added safely.
+    The site's ``time`` coordinate is the reference axis. The incoming variable
+    is explicitly reindexed to it, using nearest timestamps within ``tolerance``.
+    A warning is emitted when the source sampling or timestamps differ. For log
+    variables, source values are averaged in linear space before conversion back
+    to log space when a resampling is needed.
 
     Parameters
     ----------
@@ -584,6 +685,12 @@ def add_variable_to_data(
         Name stored in the site's Dataset. Defaults to ``data_array.name``.
     overwrite : bool
         Whether to replace an existing variable with the same name.
+    log_variable : bool
+        Whether values are logarithmic and must be averaged in linear space
+        when the source is resampled.
+    tolerance : str or pandas.Timedelta, optional
+        Maximum timestamp difference accepted when matching the source to the
+        site's time axis. ``None`` requires exact timestamps.
 
     Returns
     -------
@@ -605,8 +712,49 @@ def add_variable_to_data(
             "Pass overwrite=True to replace it."
         )
 
+    target_ds = data[site]
+    if "time" not in target_ds.coords:
+        raise KeyError(f"Site '{site}' dataset has no 'time' coordinate.")
+    if "time" not in data_array.dims and "time" not in data_array.coords:
+        raise KeyError("data_array must have a 'time' dimension or coordinate.")
+
+    source = data_array
+    if "time" not in source.dims:
+        source = source.swap_dims({source.dims[0]: "time"})
+    source = source.sortby("time")
+    source_times = pd.DatetimeIndex(source.time.values)
+    target_times = pd.DatetimeIndex(target_ds.time.values)
+
+    source_step = source_times.to_series().diff().median()
+    target_step = target_times.to_series().diff().median()
+    if source_step != target_step:
+        warnings.warn(
+            f"Adding '{target_name}' at {source_step} to '{site}' data at "
+            f"{target_step}; values will be aligned to the site's time axis.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if len(source_times) and len(target_times):
+        if not source_times.equals(target_times):
+            warnings.warn(
+                f"Timestamps for '{target_name}' differ from the site's time axis; "
+                "nearest-time alignment will be used.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    if source_step != target_step and log_variable:
+        linear = 10.0 ** (source / 10.0)
+        source = 10.0 * np.log10(linear.resample(time=target_step).mean())
+        source.attrs = data_array.attrs.copy()
+        source.attrs["log_resampled"] = True
+
+    match_tolerance = pd.Timedelta(tolerance) if tolerance is not None else None
+    aligned = source.reindex(time=target_times, method="nearest", tolerance=match_tolerance)
+
     result = {current_site: ds.copy() for current_site, ds in data.items()}
-    result[site][target_name] = data_array.rename(target_name)
+    result[site][target_name] = aligned.rename(target_name)
     return result
 
 def filter_data_by_max_values(data: dict, variables: list):
@@ -866,6 +1014,121 @@ def compute_vertical_over_threshold_fraction(
     ] = f"Fraction of vertical levels along {vertical_dim}{slice_str} where {var_name} > {threshold}"
 
     return fraction
+
+
+def load_mrr_precip_fraction(
+    data: Dict[str, xr.Dataset],
+    site: str | Sequence[str],
+    file_start_date: str,
+    file_end_date: str,
+    timestep: Optional[str] = "30min",
+    variable: str = "Zea",
+    dbz_threshold: float = 1.0,
+    altitude_range: Optional[Tuple[float, float]] = (0.0, 1000.0),
+    data_folder_path: Optional[str] = None,
+    variable_name: Optional[str] = None,
+    overwrite: bool = True,
+) -> Dict[str, xr.Dataset]:
+    """Load MRR monthly files and add precipitation-fraction variables.
+
+    ``site`` may be one site name or a sequence of site names. If no MRR file
+    overlaps the requested period for a site, an all-NaN variable is added on
+    that site's existing time axis.
+    """
+    data_folder = (
+        Path(data_folder_path)
+        if data_folder_path is not None
+        else _default_data_folder_path() / "MRR_Zea_averaged" / "monthly"
+    )
+    sites = [site] if isinstance(site, str) else list(site)
+    if not sites:
+        raise ValueError("site must contain at least one site name.")
+
+    requested_start = pd.Timestamp(file_start_date)
+    requested_end = pd.Timestamp(file_end_date)
+    if requested_end < requested_start:
+        raise ValueError("file_end_date must not precede file_start_date.")
+
+    result = data
+    for current_site in sites:
+        if current_site not in result:
+            raise KeyError(f"Site '{current_site}' is not present in data.")
+
+        target_name = variable_name or f"precip_fraction_{current_site.lower()}"
+        pattern = f"zea_averaged10min_mrr_{current_site}_*.nc"
+        date_pattern = re.compile(
+            rf"zea_averaged10min_mrr_{re.escape(current_site)}_(\d{{8}})_(\d{{8}})\.nc$"
+        )
+        file_paths = []
+        for path in sorted(data_folder.glob(pattern)):
+            match = date_pattern.fullmatch(path.name)
+            if match is None:
+                continue
+            file_start = pd.to_datetime(match.group(1), format="%Y%m%d")
+            file_end = pd.to_datetime(match.group(2), format="%Y%m%d")
+            if file_end >= requested_start and file_start <= requested_end:
+                file_paths.append(path)
+
+        if not file_paths:
+            warnings.warn(
+                f"No MRR files found for site '{current_site}' overlapping "
+                f"{file_start_date} to {file_end_date}; adding '{target_name}' as NaN.",
+                UserWarning,
+                stacklevel=2,
+            )
+            precip_fraction = xr.DataArray(
+                np.full(result[current_site].sizes["time"], np.nan),
+                coords={"time": result[current_site].time},
+                dims="time",
+                name=target_name,
+            )
+        else:
+            monthly_datasets = []
+            for path in file_paths:
+                with xr.open_dataset(path) as monthly_ds:
+                    if variable not in monthly_ds:
+                        raise KeyError(f"Variable '{variable}' not found in {path}.")
+                    monthly_datasets.append(monthly_ds.load())
+
+            mrr_data = xr.concat(monthly_datasets, dim="time").sortby("time")
+            mrr_data = mrr_data.sel(
+                time=slice(requested_start, requested_end + pd.Timedelta(days=1))
+            )
+            if mrr_data.sizes.get("time", 0) == 0:
+                warnings.warn(
+                    f"MRR files for site '{current_site}' contain no data between "
+                    f"{file_start_date} and {file_end_date}; adding '{target_name}' as NaN.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                precip_fraction = xr.DataArray(
+                    np.full(result[current_site].sizes["time"], np.nan),
+                    coords={"time": result[current_site].time},
+                    dims="time",
+                    name=target_name,
+                )
+            else:
+                if timestep is not None:
+                    mrr_data = resample_dbz(mrr_data, variable, timestep)
+
+                precip_fraction = compute_vertical_over_threshold_fraction(
+                    mrr_data,
+                    var_name=variable,
+                    vertical_dim="range",
+                    threshold=dbz_threshold,
+                    height_slice=altitude_range,
+                ).rename(target_name)
+
+        result = add_variable_to_data(
+            result,
+            site=current_site,
+            data_array=precip_fraction,
+            variable_name=target_name,
+            overwrite=overwrite,
+            log_variable=False,
+        )
+
+    return result
 
 ## STATS ##
 def compute_variable_stats(
