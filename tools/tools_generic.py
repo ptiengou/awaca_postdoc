@@ -1365,6 +1365,96 @@ def plot_monthly_availability_table(
 
     #return df_avail
 
+def plot_daily_availability_table(
+    sensor_datasets: Dict[str, xr.Dataset],
+    variables: List[str],
+    sites: List[str],
+    var_to_longname: Optional[Dict[str, str]] = None,
+    figsize: Optional[Tuple[int, int]] = None,
+) -> pd.DataFrame:
+    """Compute and display daily data availability (%) in a color-coded heatmap table.
+
+    One row per variable-site combination, one column per day (YYYY-MM-DD).
+
+    Colors:
+        - Green:  > 90%
+        - Yellow: 70% - 90%
+        - Orange: 40% - 70%
+        - Red:    < 40%
+
+    Returns:
+        pd.DataFrame: Matrix of percentage availability values.
+    """
+    availability_records = {}
+
+    for var in variables:
+        var_label = (var_to_longname or {}).get(var, var)
+
+        for site in sites:
+            ds = sensor_datasets.get(site)
+            if ds is None or var not in ds:
+                continue
+
+            da = ds[var]
+            time_coord = "time" if "time" in da.coords else "t"
+
+            # Create boolean mask (1 = valid, 0 = NaN)
+            valid_mask = ~np.isnan(da)
+
+            # Resample daily: compute ratio of valid timesteps / total expected timesteps
+            # Using 'sum' for valid timesteps and 'count' for total expected timesteps in day
+            daily_valid = valid_mask.resample({time_coord: "1D"}).sum()
+            daily_total = valid_mask.resample({time_coord: "1D"}).count()
+
+            daily_pct = (daily_valid / daily_total) * 100.0
+
+            # Convert to Series indexed by YYYY-MM-DD
+            s = daily_pct.to_series()
+            s.index = s.index.strftime("%Y-%m-%d")
+
+            row_name = f"{site} — {var_label}"
+            availability_records[row_name] = s
+
+    if not availability_records:
+        raise ValueError("No matching data found to construct table.")
+
+    # Combine into single DataFrame (Rows: Variable per Site, Columns: Days)
+    df_avail = pd.DataFrame(availability_records).T.sort_index()
+
+    # Define custom discrete colormap matching specified thresholds
+    # Thresholds: [<40%, 40-70%, 70-90%, >90%]
+    bounds = [0, 40, 70, 90, 100]
+    hex_colors = ["#d7191c", "#fdae61", "#ffffbf", "#1a9641"]  # Red, Orange, Yellow, Green
+    cmap = mcolors.ListedColormap(hex_colors)
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+
+    # Plot Setup (adjusted scaling factor for daily resolution columns)
+    if figsize is None:
+        figsize = (max(14, len(df_avail.columns) * 0.3), len(df_avail) * 0.6 + 2)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Disable numerical annotations if there are too many columns to prevent overlap
+    show_annot = len(df_avail.columns) <= 31
+
+    sns.heatmap(
+        df_avail,
+        annot=show_annot,
+        fmt=".0f",
+        cmap=cmap,
+        norm=norm,
+        cbar_kws={"label": "Availability (%)"},
+        linewidths=0.5 if show_annot else 0.0,
+        linecolor="white",
+        ax=ax,
+    )
+
+    ax.set_title("Data Availability Matrix by Site and Variable (%)", fontsize=14, pad=15)
+    ax.set_xlabel("Date", fontsize=11)
+    ax.set_ylabel("Site — Variable", fontsize=11)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+
 ## PLOTTING ##
 
 ## Time plots
