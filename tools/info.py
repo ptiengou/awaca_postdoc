@@ -1,5 +1,12 @@
 sites=['ddu','d17','d47','d85','dmc']
 sensors=['FLOWCAPT','SPC','SURF','WIND','MRR']#,'METEK']
+sites_coord = {
+    "DDU": (140.0014, -66.6628),
+    "D17": (139.71,   -66.72),
+    "D47": (138.70,   -67.39),
+    "D85": (134.11,   -70.43),
+    "DMC": (123.33,   -75.10)
+}
 
 prefix_to_resample_freq = {
     'FLOWCAPT':'10min',
