@@ -1,4 +1,5 @@
 import numpy as np
+import sys
 import netCDF4 as nc
 import xarray as xr
 import pandas as pd
@@ -38,7 +39,13 @@ from functools import partial
 from sklearn.cluster import KMeans
 import re
 import warnings
-
+from matplotlib.axes import Axes
+from matplotlib.lines import Line2D
+from cartopy.mpl.geoaxes import GeoAxes
+from IPython.display import display
+from matplotlib.collections import QuadMesh
+from matplotlib.figure import Figure
+from __future__ import annotations
 
 #import psyplot.project as psy
 
@@ -73,7 +80,7 @@ plt.rcParams.update(
                     '#9E9E9E', #light grey
                     '#FF9500', #orange/yellow
                 ]
-            ) * cycler(alpha=[0.8]),
+            ) * cycler(alpha=[1]),
             'scatter.marker': 'x',
             'lines.linewidth': 1.5,
         })
